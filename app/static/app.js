@@ -23,9 +23,9 @@ const state = {
   previewFresh: false, // 页面预览是否已追上最新草稿；未追上时禁止下载与合并
   importing: false, // /api/import 在途（期间忽略重复提交）
   saving: false, // /api/save 在途
-  merging: false, // /api/merge 在途（期间阻止编辑 / 删除 / 重排 / 勾选 / 重复合并）
-  splitting: false, // /api/split 在途（期间阻止其他改稿）
-  duplicating: false, // /api/duplicate 在途（期间阻止其他改稿与重复提交）
+  merging: false, // 合并写稿在途：由写稿提交协调层统一置位/复位（期间阻止编辑 / 删除 / 重排 / 勾选 / 重复提交）
+  splitting: false, // 拆分写稿在途：由写稿提交协调层统一置位/复位（期间阻止其他改稿）
+  duplicating: false, // 复制写稿在途：由写稿提交协调层统一置位/复位（期间阻止其他改稿与重复提交）
   exporting: false, // /api/export 在途
   baseline: null, // 成功导入后不可变的原稿基线（{ order_ids, clauses }，深拷贝）；重新导入清空
   diffOpen: false, // 原稿对照面板是否展开
@@ -349,6 +349,7 @@ importBtn.addEventListener("click", async () => {
     state.splitRefsTo = "front";
     state.splitting = false;
     state.duplicating = false;
+    writeInFlight = null; // 写稿协调层归属随新草稿一并清空：旧写稿的迟到收尾不得占用新请求
     state.idCounter = data.clauses.length; // 导入身份为 c1..cN，拆分/复制新身份从 N+1 起
     // 成功导入建立不可变原稿基线（深拷贝），同时收起并清空旧对照
     state.baseline = {
@@ -432,6 +433,7 @@ $("#reimport-btn").addEventListener("click", () => {
   state.merging = false;
   state.splitting = false;
   state.duplicating = false;
+  writeInFlight = null; // 写稿协调层归属立即移交给新草稿：旧请求的成功/错误/收尾都不再算数
   state.exporting = false;
   exportSeq += 1; // 作废旧下载对等待状态的收尾权：其成功或失败都不得解锁新草稿的下载按钮
   previewInFlight = false; // 上一草稿在途预览的收尾将因世代不符而直接返回，这里复位在途态
@@ -673,6 +675,102 @@ function editorHtml(item) {
 }
 
 // --------------------------------------------------------------------------- //
+// 写稿提交协调层（合并 / 拆分 / 复制三条路径共用）
+// --------------------------------------------------------------------------- //
+// 边界：三个入口（合并按钮、拆分确认、复制按钮）只保留各自的本地预检、参数准备、
+// 确认弹窗与各自的错误展示；下列事项一律收拢在本协调层，入口不再各自重复：
+// - 请求归属：同一时刻最多一个写稿在途，阻止其他改稿与重复提交（仅置灰，不动入口）；
+//   重新导入不被阻止，并移交归属——旧请求的成功、错误与收尾都不得改新稿，
+//   也不得解除新请求（或新草稿）的等待状态。
+// - 草稿安装：仅在服务端成功后，把返回的正文（clauses）与顺序（order_ids）连同
+//   身份上界（idCounter：合并不推进、拆分 +1、复制取返回 next_id）一起写回；
+//   touch() 会按原规则令对照、引用追踪与摘录失效。写稿失败则正文、顺序、身份上界
+//   与勾选一律不动（拆分的分界与引用落点由入口自行保留）。
+// - 收尾：等待态、列表置灰、工具栏恢复、以及成功后的 touch()+render()。
+// 写稿成功后预览失败的处理不在写稿层之外另起炉灶：已提交结果与身份上界保留，
+// 只重试预览（render 不重发写稿请求）；恢复前列表锁定（listLocked），旧编号跳转
+// 与下载保持禁用。取消（拆分/编辑取消）不发写稿请求，协调不靠重置页面实现。
+const WRITE_KIND_MERGE = "merge";
+const WRITE_KIND_SPLIT = "split";
+const WRITE_KIND_DUPLICATE = "duplicate";
+
+const WRITE_API = {
+  [WRITE_KIND_MERGE]: "/api/merge",
+  [WRITE_KIND_SPLIT]: "/api/split",
+  [WRITE_KIND_DUPLICATE]: "/api/duplicate",
+};
+
+// 各类写稿对应的等待态标志（合并 / 拆分 / 复制在途期间统一阻止其他改稿与重复提交）
+const WRITE_BUSY_FLAG = {
+  [WRITE_KIND_MERGE]: "merging",
+  [WRITE_KIND_SPLIT]: "splitting",
+  [WRITE_KIND_DUPLICATE]: "duplicating",
+};
+
+// 当前在途写稿的类别；null 表示没有写稿在途。等待归属只由本协调层在发请求前置位、
+// 在“仍归属当前草稿”的响应/收尾处复位；重新导入直接置空，旧请求此后无权收尾。
+let writeInFlight = null;
+
+// 成功写回：正文与顺序必须一起更新（二者都以同一份服务端结果为准），再按种类推进
+// 身份上界——合并不推进（保留身份仍在、较后身份移除且不复用），拆分恰好 +1，
+// 复制采用服务端返回的上界。返回的 clauses 一律重建，避免草稿误挂旧对象。
+function installWriteResult(kind, data) {
+  state.orderIds = data.order_ids;
+  state.clauses = data.clauses.map((c) => ({
+    id: c.id,
+    original: parseInt(c.id.slice(1), 10),
+    body: c.body,
+  }));
+  if (kind === WRITE_KIND_SPLIT) {
+    state.idCounter += 1; // 后段新身份已投入使用
+  } else if (kind === WRITE_KIND_DUPLICATE) {
+    state.idCounter = data.next_id; // 与拆分共用同一身份上界，以服务端返回为准
+  }
+  // 合并：沿用较前身份、移除较后身份，上界不推进
+}
+
+// 写稿提交统一入口：加锁（阻止其他改稿与重复提交）→ 发请求 → 成功安装草稿并刷新
+// 预览，失败时草稿原样不动并把错误交回入口展示。
+// hooks：
+//   busy()      置位等待态后同步入口自身 UI（如拆分按钮显示「拆分中…」）；
+//   installed() 成功安装后、touch 前做种类专属收尾（收起拆分选择器 / 清空勾选 /
+//               收起指向被合并条款的引用面板）；
+//   failed(e)   失败时按入口自身方式展示错误（弹窗或卡片内错误），并负责保留
+//               拆分分界与引用落点等入口本地状态。
+async function submitWrite(kind, payload, hooks = {}) {
+  if (writeInFlight) return; // 已有写稿在途：阻止重复提交及其他写稿入口
+  const epoch = state.epoch;
+  writeInFlight = kind;
+  state[WRITE_BUSY_FLAG[kind]] = true;
+  syncBusy();
+  if (hooks.busy) hooks.busy();
+  syncToolbar();
+  let data;
+  try {
+    data = await api(WRITE_API[kind], payload);
+  } catch (e) {
+    // 重新导入后旧请求失败：不得在新稿上提示，也不得解除新请求 / 新草稿的等待
+    if (epoch !== state.epoch || writeInFlight !== kind) return;
+    writeInFlight = null;
+    state[WRITE_BUSY_FLAG[kind]] = false;
+    if (hooks.failed) hooks.failed(e); // 失败不改正文 / 顺序 / 身份上界 / 勾选
+    syncBusy();
+    syncToolbar();
+    return;
+  }
+  // 已重新导入：旧写稿成功不得写回新草稿，等待归属已由重新导入移交，这里不收尾
+  if (epoch !== state.epoch || writeInFlight !== kind) return;
+  writeInFlight = null;
+  state[WRITE_BUSY_FLAG[kind]] = false;
+  installWriteResult(kind, data);
+  if (hooks.installed) hooks.installed(data);
+  touch(); // 正文 / 顺序已变：对照、引用追踪、摘录按原规则失效
+  render(); // 成功后只跟随一次预览；预览失败则仅可重试预览，不重发写稿请求
+  syncBusy();
+  syncToolbar();
+}
+
+// --------------------------------------------------------------------------- //
 // 拆分一条条款
 // --------------------------------------------------------------------------- //
 // 把内部正文解析为文本 / 引用标记 token 序列（内部形态已由服务端校验，标记一定完整）
@@ -790,12 +888,12 @@ function showSplitError(id, errors) {
 }
 
 async function submitSplit(id) {
-  if (state.splitting || state.splittingId !== id) return; // 阻止重复提交
+  if (writeInFlight || state.splittingId !== id) return; // 阻止重复提交
   const clause = state.clauses.find((c) => c.id === id);
   const offset = state.splitOffset;
   if (!clause || offset === null) return;
 
-  // 本地预检（服务端仍会复核；失败一律不改动草稿）
+  // 入口本地预检（服务端仍会复核；预检失败不进入协调层，草稿不变）
   const chars = [...clause.body];
   if (
     chars.slice(0, offset).join("").trim() === "" ||
@@ -809,53 +907,32 @@ async function submitSplit(id) {
     return;
   }
 
-  // 后段新身份：本草稿从未用过的 id（删除/合并移除的身份不复用，失效引用不会复活）
+  // 入口参数准备：后段新身份取本草稿从未用过的 id（删除/合并移除的身份不复用）
   const newId = `c${state.idCounter + 1}`;
-  const epoch = state.epoch;
-  // 提交期间阻止其他改稿（列表置灰），成功或失败后恢复
-  state.splitting = true;
-  syncBusy();
-  setSplitBusy(id, true);
-  syncToolbar();
-  try {
-    const data = await api("/api/split", {
-      ...snapshot(),
-      split_id: id,
-      offset,
-      new_id: newId,
-      refs_to: state.splitRefsTo,
-    });
-    if (epoch !== state.epoch) return; // 已重新导入：旧拆分结果不得写回新草稿
-    // 仅在服务端成功后才改动草稿，保证列表 / 预览 / 引用跳转 / 下载立即对应同一份草稿
-    state.orderIds = data.order_ids;
-    state.clauses = data.clauses.map((c) => ({
-      id: c.id,
-      original: parseInt(c.id.slice(1), 10),
-      body: c.body,
-    }));
-    state.idCounter += 1; // 新身份已投入使用，计数推进
-    state.splittingId = null;
-    state.splitOffset = null;
-    state.splitRefsTo = "front";
-    state.splitting = false;
-    touch();
-    render();
-  } catch (e) {
-    if (epoch !== state.epoch) return; // 旧草稿的失败不在新草稿上提示
-    // 拆分请求失败（含断网等异常）：草稿未改动，分界与引用落点保留供重试或取消；
-    // 用归一化后的错误信息展示，避免异常对象没有 errors 时提示处理再抛异常
-    state.splitting = false;
-    setSplitBusy(id, false);
-    const card = document.getElementById(`card-${id}`);
-    if (card) refreshSplitUi(card);
-    showSplitError(id, errorList(e));
-  } finally {
-    // 重新导入后，旧请求的收尾不得改动新稿的列表状态、提示或按钮
-    if (epoch === state.epoch) {
-      syncBusy();
-      syncToolbar();
-    }
-  }
+  const payload = {
+    ...snapshot(),
+    split_id: id,
+    offset,
+    new_id: newId,
+    refs_to: state.splitRefsTo,
+  };
+  await submitWrite(WRITE_KIND_SPLIT, payload, {
+    busy: () => setSplitBusy(id, true),
+    installed: () => {
+      // 成功后收起拆分选择器；分界 / 引用落点随成功一并复位
+      state.splittingId = null;
+      state.splitOffset = null;
+      state.splitRefsTo = "front";
+    },
+    failed: (e) => {
+      // 拆分失败：草稿（正文 / 顺序 / 身份上界 / 勾选）未改动，分界与引用落点
+      // 保留供重试或取消；错误信息显示在卡片内
+      setSplitBusy(id, false);
+      const card = document.getElementById(`card-${id}`);
+      if (card) refreshSplitUi(card);
+      showSplitError(id, errorList(e));
+    },
+  });
 }
 
 // --------------------------------------------------------------------------- //
@@ -890,14 +967,14 @@ clauseList.addEventListener("change", (ev) => {
 // 合并两条条款
 // --------------------------------------------------------------------------- //
 mergeBtn.addEventListener("click", async () => {
-  if (state.merging || state.duplicating) return; // 阻止重复提交
+  if (writeInFlight) return; // 写稿协调层：合并 / 拆分 / 复制在途时阻止重复提交
   if (state.editingId) {
     alert("请先保存或取消正在编辑的正文，再合并条款。");
     return;
   }
   if (state.pickIds.length !== 2 || !state.previewFresh || !state.preview) return;
 
-  // 按当前显示顺序确定较前 / 较后条款
+  // 入口参数准备：按当前显示顺序确定较前 / 较后条款
   const [a, b] = state.pickIds;
   const keepId = state.orderIds.indexOf(a) < state.orderIds.indexOf(b) ? a : b;
   const dropId = keepId === a ? b : a;
@@ -920,96 +997,53 @@ mergeBtn.addEventListener("click", async () => {
     `此操作在重新导入或刷新前不可撤销，确定合并？`;
   if (!confirm(msg)) return;
 
-  const epoch = state.epoch;
-  // 提交期间阻止编辑 / 删除 / 重排 / 勾选 / 重复合并，成功或失败后恢复
-  state.merging = true;
-  syncBusy();
-  syncToolbar();
-  try {
-    const data = await api("/api/merge", {
-      ...snapshot(),
-      keep_id: keepId,
-      drop_id: dropId,
-    });
-    if (epoch !== state.epoch) return; // 已重新导入：旧合并结果不得作用于新草稿
-    // 仅在服务端成功后才改动草稿，保证列表 / 预览 / 下载立即对应同一份草稿
-    state.orderIds = data.order_ids;
-    state.clauses = data.clauses.map((c) => ({
-      id: c.id,
-      original: parseInt(c.id.slice(1), 10),
-      body: c.body,
-    }));
-    // 被并入的较后条款已移除：查询它的面板立即收起清空（查较前条款的保留并自动重查）
-    if (state.refsId === dropId) closeReferrers();
-    state.pickIds = [];
-    state.merging = false;
-    touch();
-    render();
-  } catch (e) {
-    if (epoch !== state.epoch) return; // 旧草稿的失败不在新草稿上提示
-    // 合并失败：草稿未改动，恢复被暂时阻止的操作（勾选保持不变，可修正后重试）
-    state.merging = false;
-    alert("合并失败，草稿未改动：\n" + errorList(e).join("\n"));
-  } finally {
-    if (epoch === state.epoch) {
-      syncBusy();
-      syncToolbar();
-    }
-  }
+  await submitWrite(
+    WRITE_KIND_MERGE,
+    { ...snapshot(), keep_id: keepId, drop_id: dropId },
+    {
+      installed: () => {
+        // 被并入的较后条款已移除：查询它的面板立即收起清空（查较前条款的保留并自动重查）
+        if (state.refsId === dropId) closeReferrers();
+        state.pickIds = []; // 成功后清空勾选；失败时勾选由协调层保证原样保留
+      },
+      failed: (e) => {
+        // 合并失败：草稿与勾选未改动，弹窗展示原因，可修正后重试
+        alert("合并失败，草稿未改动：\n" + errorList(e).join("\n"));
+      },
+    },
+  );
 });
 
 // --------------------------------------------------------------------------- //
 // 复制所选一组条款
 // --------------------------------------------------------------------------- //
 duplicateBtn.addEventListener("click", async () => {
-  if (state.duplicating || state.merging || state.splitting) return; // 阻止重复提交
+  if (writeInFlight) return; // 写稿协调层：合并 / 拆分 / 复制在途时阻止重复提交
   if (state.editingId || state.splittingId) return; // 未保存编辑 / 拆分选择未结束时不能复制（按钮已禁用，这里兜底）
   const picks = state.pickIds.slice();
   if (!picks.length || !state.previewFresh) return;
 
-  // 本地预检（服务端仍会复核；失败一律不改动草稿）
+  // 入口本地预检（服务端仍会复核；预检失败不进入协调层，草稿不变）
   const total = state.orderIds.length + picks.length;
   if (total > MAX_CLAUSES) {
     alert(`复制后共 ${total} 条，超过上限 ${MAX_CLAUSES} 条，不能复制。`);
     return;
   }
 
-  const epoch = state.epoch;
-  // 提交期间阻止其他改稿（列表置灰），成功或失败后恢复
-  state.duplicating = true;
-  syncBusy();
-  syncToolbar();
-  try {
-    const data = await api("/api/duplicate", {
-      ...snapshot(),
-      selected_ids: picks,
-      next_id: state.idCounter, // 已用身份上界：副本从 next_id+1 起取新身份
-    });
-    if (epoch !== state.epoch) return; // 已重新导入：旧复制结果不得写回新草稿
-    // 仅在服务端成功后才改动草稿，保证列表 / 预览 / 对照 / 下载立即对应同一份草稿
-    state.orderIds = data.order_ids;
-    state.clauses = data.clauses.map((c) => ({
-      id: c.id,
-      original: parseInt(c.id.slice(1), 10),
-      body: c.body,
-    }));
-    state.idCounter = data.next_id; // 复制与拆分共用更新后的身份上界
-    state.pickIds = [];
-    state.duplicating = false;
-    touch();
-    render();
-  } catch (e) {
-    if (epoch !== state.epoch) return; // 旧草稿的失败不在新草稿上提示
-    // 复制失败：草稿未改动，恢复被暂时阻止的操作（勾选保持不变，可修正后重试）
-    state.duplicating = false;
-    alert("复制失败，草稿未改动：\n" + errorList(e).join("\n"));
-  } finally {
-    // 重新导入后，旧请求的收尾不得改动新稿的列表状态、提示或按钮
-    if (epoch === state.epoch) {
-      syncBusy();
-      syncToolbar();
-    }
-  }
+  // 入口参数准备：已用身份上界，副本新身份由服务端从 next_id+1 起分配并回传新上界
+  await submitWrite(
+    WRITE_KIND_DUPLICATE,
+    { ...snapshot(), selected_ids: picks, next_id: state.idCounter },
+    {
+      installed: () => {
+        state.pickIds = []; // 成功后清空勾选；失败时勾选由协调层保证原样保留
+      },
+      failed: (e) => {
+        // 复制失败：草稿与勾选未改动，弹窗展示原因，可修正后重试
+        alert("复制失败，草稿未改动：\n" + errorList(e).join("\n"));
+      },
+    },
+  );
 });
 
 // --------------------------------------------------------------------------- //
