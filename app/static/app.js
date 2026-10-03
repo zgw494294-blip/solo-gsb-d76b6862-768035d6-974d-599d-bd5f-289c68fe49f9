@@ -23,9 +23,8 @@ const state = {
   previewFresh: false, // 页面预览是否已追上最新草稿；未追上时禁止下载与合并
   importing: false, // /api/import 在途（期间忽略重复提交）
   saving: false, // /api/save 在途
-  merging: false, // /api/merge 在途（期间阻止编辑 / 删除 / 重排 / 勾选 / 重复合并）
-  splitting: false, // /api/split 在途（期间阻止其他改稿）
-  duplicating: false, // /api/duplicate 在途（期间阻止其他改稿与重复提交）
+  writing: null, // 在途写稿提交（null | "merge" | "split" | "duplicate"）：合并 / 拆分 / 复制共用的
+  // 提交协调层状态；提交期间阻止其他改稿与重复提交，但允许重新导入
   exporting: false, // /api/export 在途
   baseline: null, // 成功导入后不可变的原稿基线（{ order_ids, clauses }，深拷贝）；重新导入清空
   diffOpen: false, // 原稿对照面板是否展开
@@ -45,6 +44,8 @@ const MAX_CLAUSES = 40; // 与后端 MAX_LINES 一致：拆分后总数不能超
 
 let previewSeq = 0; // 预览请求序号：只采用最后一次发出的预览响应
 let exportSeq = 0; // 下载请求序号：只有仍持有它的下载能收尾按钮；重新导入 / 新下载会作废旧下载的收尾权
+let writeSeq = 0; // 写稿提交序号（合并 / 拆分 / 复制共用）：重新导入会推进它，旧写稿请求的成功、
+// 错误与收尾一律落空——不得改动新稿，也不得解除新请求的等待状态
 let previewInFlight = false; // 是否已有 /api/preview 在途：防止重试预览重复提交
 let diffSeq = 0; // 对照请求序号：只采用最后一次发出的对照响应，迟到响应不得覆盖新结果
 let diffInFlight = false; // 是否已有 /api/diff 在途：防止重复提交
@@ -181,13 +182,13 @@ function syncToolbar() {
 }
 
 // 列表是否应整体暂停操作（置灰、拦截事件，结束后自动恢复）：
-// - 合并 / 拆分 / 复制提交在途；
+// - 写稿提交（合并 / 拆分 / 复制）在途；
 // - 预览失败且页面停留在旧编号（renderedRev 与当前草稿不一致）；
 // - 预览失败且刚打开的拆分选择器 / 编辑器尚未渲染出来（DOM 里没有对应入口）。
 // 已成功渲染的拆分选择器在预览失败时仍可继续操作（选分界、确认、取消），
 // 其重试入口在失败横幅上。
 function listLocked() {
-  if (state.merging || state.splitting || state.duplicating) return true;
+  if (state.writing) return true;
   if (state.previewError === null) return false;
   if (state.renderedRev !== state.rev) return true;
   if (state.splittingId !== null && state.renderedSplittingId !== state.splittingId) return true;
@@ -232,17 +233,16 @@ function syncPreviewErrorBanner() {
 }
 
 function updateMergeBtn() {
-  if (state.merging) {
+  if (state.writing === "merge") {
     mergeBtn.disabled = true;
     mergeBtn.textContent = "合并中…";
     return;
   }
-  // 合并仍只允许两条：勾选恰好两条且未在编辑 / 拆分选择 / 其他提交在途时可用
+  // 合并仍只允许两条：勾选恰好两条且未在编辑 / 拆分选择 / 写稿提交在途时可用
   mergeBtn.disabled =
     state.editingId !== null ||
     state.splittingId !== null ||
-    state.splitting ||
-    state.duplicating ||
+    state.writing !== null ||
     !state.previewFresh ||
     state.pickIds.length !== 2;
   mergeBtn.textContent =
@@ -252,7 +252,7 @@ function updateMergeBtn() {
 }
 
 function updateDuplicateBtn() {
-  if (state.duplicating) {
+  if (state.writing === "duplicate") {
     duplicateBtn.disabled = true;
     duplicateBtn.textContent = "复制中…";
     return;
@@ -264,8 +264,7 @@ function updateDuplicateBtn() {
   duplicateBtn.disabled =
     state.editingId !== null ||
     state.splittingId !== null ||
-    state.merging ||
-    state.splitting ||
+    state.writing !== null ||
     !state.previewFresh ||
     picks < 1 ||
     overLimit;
@@ -280,9 +279,7 @@ function updateDuplicateBtn() {
 function updateDownloadBtn() {
   downloadBtn.disabled =
     state.exporting ||
-    state.merging ||
-    state.splitting ||
-    state.duplicating ||
+    state.writing !== null ||
     !state.previewFresh ||
     !state.preview ||
     state.preview.has_broken;
@@ -301,9 +298,7 @@ function updateExcerptBtn() {
   excerptBtn.disabled =
     state.editingId !== null ||
     state.splittingId !== null ||
-    state.merging ||
-    state.splitting ||
-    state.duplicating ||
+    state.writing !== null ||
     !state.previewFresh ||
     state.pickIds.length < 1;
   excerptBtn.textContent = "导出摘录";
@@ -347,8 +342,7 @@ importBtn.addEventListener("click", async () => {
     state.splittingId = null;
     state.splitOffset = null;
     state.splitRefsTo = "front";
-    state.splitting = false;
-    state.duplicating = false;
+    state.writing = null; // 新草稿无写稿在途；上一草稿的在途写稿因世代不符，其响应与收尾一律落空
     state.idCounter = data.clauses.length; // 导入身份为 c1..cN，拆分/复制新身份从 N+1 起
     // 成功导入建立不可变原稿基线（深拷贝），同时收起并清空旧对照
     state.baseline = {
@@ -429,9 +423,8 @@ $("#reimport-btn").addEventListener("click", () => {
   state.previewFresh = false;
   state.rev += 1;
   state.saving = false;
-  state.merging = false;
-  state.splitting = false;
-  state.duplicating = false;
+  state.writing = null;
+  writeSeq += 1; // 作废旧写稿请求：其成功 / 失败 / 收尾不得改新稿或解除新请求的等待状态
   state.exporting = false;
   exportSeq += 1; // 作废旧下载对等待状态的收尾权：其成功或失败都不得解锁新草稿的下载按钮
   previewInFlight = false; // 上一草稿在途预览的收尾将因世代不符而直接返回，这里复位在途态
@@ -615,7 +608,7 @@ async function renderPreview(epoch, rev, seq) {
   state.renderedRev = rev;
   state.renderedSplittingId = state.splittingId;
   state.renderedEditingId = state.editingId;
-  clauseList.classList.toggle("busy", state.merging || state.splitting || state.duplicating);
+  clauseList.classList.toggle("busy", state.writing !== null);
   syncToolbar();
 
   // 拆分选择器打开时，按当前状态恢复其分界选中态与按钮可用态
@@ -670,6 +663,69 @@ function editorHtml(item) {
       </div>
       <ul class="edit-errors" data-role="edit-errors" hidden></ul>
     </div>`;
+}
+
+// --------------------------------------------------------------------------- //
+// 写稿提交协调层（合并 / 拆分 / 复制共用）
+// --------------------------------------------------------------------------- //
+// 三个写稿入口共用同一条提交管线，请求归属、草稿安装与收尾只在这里实现一次：
+// - 请求归属：世代（epoch）+ 提交序号（writeSeq）双重归属。重新导入后旧请求的
+//   成功、错误与收尾一律落空——不得改动新稿，也不得解除新请求的等待状态。
+// - 互斥：提交期间（state.writing 非空）阻止其他改稿与重复提交，但允许重新导入。
+// - 成功写回：正文、顺序与身份上界一起更新（合并不推进上界、拆分推进 1、复制采用
+//   接口返回的上界），随后 touch() 使对照 / 引用追踪 / 摘录按原规则失效并刷新预览；
+//   此后若预览失败，提交结果与上界保留、仅重试预览（见 render / failPreview），
+//   预览恢复前禁止旧编号跳转与下载。
+// - 失败：不改正文、顺序、身份上界与勾选（拆分的分界与引用落点随入口状态保留），
+//   错误归一化后交回入口按各自方式展示。
+// 入口只负责本地预检、参数准备、确认与各自的错误展示；取消不经过这里（不发写稿请求）。
+// spec = {
+//   kind,              // "merge" | "split" | "duplicate"
+//   path,              // 接口路径（POST JSON，HTTP 方法 / 字段 / 状态码保持既有约定）
+//   params,            // 入口备好的接口参数（草稿快照由协调层统一附上）
+//   onSuccess(data)?,  // 入口附加的成功处理（如收起被并条款的引用面板、退出拆分选择器）
+//   onError(errors)?,  // 入口各自的错误展示（errors 已归一化为字符串数组）
+//   onBusy(busy)?,     // 入口自己的忙碌态展示（如拆分选择器按钮；成功不写回时不再复位）
+// }
+async function submitWrite(spec) {
+  if (state.writing) return; // 已有写稿提交在途：阻止重复提交与其他写稿
+  const epoch = state.epoch;
+  const token = ++writeSeq;
+  state.writing = spec.kind;
+  if (spec.onBusy) spec.onBusy(true);
+  syncBusy();
+  syncToolbar();
+  try {
+    const data = await api(spec.path, { ...snapshot(), ...spec.params });
+    if (token !== writeSeq || epoch !== state.epoch) return; // 已重新导入：旧结果不得写回新稿
+    // 仅在服务端成功后才改动草稿：正文、顺序与身份上界一起写回，
+    // 保证列表 / 预览 / 对照 / 引用追踪 / 摘录 / 下载立即对应同一份草稿
+    state.orderIds = data.order_ids;
+    state.clauses = data.clauses.map((c) => ({
+      id: c.id,
+      original: parseInt(c.id.slice(1), 10),
+      body: c.body,
+    }));
+    if (spec.kind === "split") state.idCounter += 1; // 拆分：新身份已投入使用，上界推进 1
+    else if (spec.kind === "duplicate") state.idCounter = data.next_id; // 复制：采用接口返回的上界
+    // 合并：不推进身份上界
+    state.writing = null;
+    if (spec.onSuccess) spec.onSuccess(data);
+    touch();
+    render();
+  } catch (e) {
+    if (token !== writeSeq || epoch !== state.epoch) return; // 旧请求的失败不在新稿上提示
+    state.writing = null;
+    if (spec.onBusy) spec.onBusy(false);
+    spec.onError(errorList(e));
+  } finally {
+    // 只有仍持有归属的提交才能收尾：重新导入后旧请求的收尾不得改动新稿的
+    // 列表状态、提示或按钮，也不得解除新请求的等待状态
+    if (token === writeSeq && epoch === state.epoch) {
+      syncBusy();
+      syncToolbar();
+    }
+  }
 }
 
 // --------------------------------------------------------------------------- //
@@ -790,7 +846,7 @@ function showSplitError(id, errors) {
 }
 
 async function submitSplit(id) {
-  if (state.splitting || state.splittingId !== id) return; // 阻止重复提交
+  if (state.writing || state.splittingId !== id) return; // 写稿在途或非当前选择器：阻止重复提交
   const clause = state.clauses.find((c) => c.id === id);
   const offset = state.splitOffset;
   if (!clause || offset === null) return;
@@ -809,53 +865,32 @@ async function submitSplit(id) {
     return;
   }
 
-  // 后段新身份：本草稿从未用过的 id（删除/合并移除的身份不复用，失效引用不会复活）
-  const newId = `c${state.idCounter + 1}`;
-  const epoch = state.epoch;
-  // 提交期间阻止其他改稿（列表置灰），成功或失败后恢复
-  state.splitting = true;
-  syncBusy();
-  setSplitBusy(id, true);
-  syncToolbar();
-  try {
-    const data = await api("/api/split", {
-      ...snapshot(),
+  // 参数准备：后段新身份为本草稿从未用过的 id（删除/合并移除的身份不复用，失效引用不会复活）；
+  // 请求归属、草稿写回（含上界推进 1）与收尾由提交协调层统一处理
+  await submitWrite({
+    kind: "split",
+    path: "/api/split",
+    params: {
       split_id: id,
       offset,
-      new_id: newId,
+      new_id: `c${state.idCounter + 1}`,
       refs_to: state.splitRefsTo,
-    });
-    if (epoch !== state.epoch) return; // 已重新导入：旧拆分结果不得写回新草稿
-    // 仅在服务端成功后才改动草稿，保证列表 / 预览 / 引用跳转 / 下载立即对应同一份草稿
-    state.orderIds = data.order_ids;
-    state.clauses = data.clauses.map((c) => ({
-      id: c.id,
-      original: parseInt(c.id.slice(1), 10),
-      body: c.body,
-    }));
-    state.idCounter += 1; // 新身份已投入使用，计数推进
-    state.splittingId = null;
-    state.splitOffset = null;
-    state.splitRefsTo = "front";
-    state.splitting = false;
-    touch();
-    render();
-  } catch (e) {
-    if (epoch !== state.epoch) return; // 旧草稿的失败不在新草稿上提示
-    // 拆分请求失败（含断网等异常）：草稿未改动，分界与引用落点保留供重试或取消；
-    // 用归一化后的错误信息展示，避免异常对象没有 errors 时提示处理再抛异常
-    state.splitting = false;
-    setSplitBusy(id, false);
-    const card = document.getElementById(`card-${id}`);
-    if (card) refreshSplitUi(card);
-    showSplitError(id, errorList(e));
-  } finally {
-    // 重新导入后，旧请求的收尾不得改动新稿的列表状态、提示或按钮
-    if (epoch === state.epoch) {
-      syncBusy();
-      syncToolbar();
-    }
-  }
+    },
+    onBusy: (busy) => setSplitBusy(id, busy),
+    onSuccess: () => {
+      // 拆分成功：退出选择器，分界与引用落点复位（草稿已由协调层写回）
+      state.splittingId = null;
+      state.splitOffset = null;
+      state.splitRefsTo = "front";
+    },
+    onError: (errors) => {
+      // 拆分请求失败（含断网等异常）：草稿未改动，分界与引用落点保留供重试或取消；
+      // 错误信息已归一化，避免异常对象没有 errors 时提示处理再抛异常
+      const card = document.getElementById(`card-${id}`);
+      if (card) refreshSplitUi(card);
+      showSplitError(id, errors);
+    },
+  });
 }
 
 // --------------------------------------------------------------------------- //
@@ -890,14 +925,14 @@ clauseList.addEventListener("change", (ev) => {
 // 合并两条条款
 // --------------------------------------------------------------------------- //
 mergeBtn.addEventListener("click", async () => {
-  if (state.merging || state.duplicating) return; // 阻止重复提交
+  if (state.writing) return; // 写稿提交在途：阻止重复提交（按钮已禁用，这里兜底）
   if (state.editingId) {
     alert("请先保存或取消正在编辑的正文，再合并条款。");
     return;
   }
   if (state.pickIds.length !== 2 || !state.previewFresh || !state.preview) return;
 
-  // 按当前显示顺序确定较前 / 较后条款
+  // 参数准备：按当前显示顺序确定较前 / 较后条款
   const [a, b] = state.pickIds;
   const keepId = state.orderIds.indexOf(a) < state.orderIds.indexOf(b) ? a : b;
   const dropId = keepId === a ? b : a;
@@ -920,49 +955,28 @@ mergeBtn.addEventListener("click", async () => {
     `此操作在重新导入或刷新前不可撤销，确定合并？`;
   if (!confirm(msg)) return;
 
-  const epoch = state.epoch;
-  // 提交期间阻止编辑 / 删除 / 重排 / 勾选 / 重复合并，成功或失败后恢复
-  state.merging = true;
-  syncBusy();
-  syncToolbar();
-  try {
-    const data = await api("/api/merge", {
-      ...snapshot(),
-      keep_id: keepId,
-      drop_id: dropId,
-    });
-    if (epoch !== state.epoch) return; // 已重新导入：旧合并结果不得作用于新草稿
-    // 仅在服务端成功后才改动草稿，保证列表 / 预览 / 下载立即对应同一份草稿
-    state.orderIds = data.order_ids;
-    state.clauses = data.clauses.map((c) => ({
-      id: c.id,
-      original: parseInt(c.id.slice(1), 10),
-      body: c.body,
-    }));
-    // 被并入的较后条款已移除：查询它的面板立即收起清空（查较前条款的保留并自动重查）
-    if (state.refsId === dropId) closeReferrers();
-    state.pickIds = [];
-    state.merging = false;
-    touch();
-    render();
-  } catch (e) {
-    if (epoch !== state.epoch) return; // 旧草稿的失败不在新草稿上提示
-    // 合并失败：草稿未改动，恢复被暂时阻止的操作（勾选保持不变，可修正后重试）
-    state.merging = false;
-    alert("合并失败，草稿未改动：\n" + errorList(e).join("\n"));
-  } finally {
-    if (epoch === state.epoch) {
-      syncBusy();
-      syncToolbar();
-    }
-  }
+  // 请求归属、草稿写回（合并不推进身份上界）与收尾由提交协调层统一处理
+  await submitWrite({
+    kind: "merge",
+    path: "/api/merge",
+    params: { keep_id: keepId, drop_id: dropId },
+    onSuccess: () => {
+      // 被并入的较后条款已移除：查询它的面板立即收起清空（查较前条款的保留并自动重查）
+      if (state.refsId === dropId) closeReferrers();
+      state.pickIds = [];
+    },
+    onError: (errors) => {
+      // 合并失败：草稿未改动，勾选保持不变，可修正后重试
+      alert("合并失败，草稿未改动：\n" + errors.join("\n"));
+    },
+  });
 });
 
 // --------------------------------------------------------------------------- //
 // 复制所选一组条款
 // --------------------------------------------------------------------------- //
 duplicateBtn.addEventListener("click", async () => {
-  if (state.duplicating || state.merging || state.splitting) return; // 阻止重复提交
+  if (state.writing) return; // 写稿提交在途：阻止重复提交（按钮已禁用，这里兜底）
   if (state.editingId || state.splittingId) return; // 未保存编辑 / 拆分选择未结束时不能复制（按钮已禁用，这里兜底）
   const picks = state.pickIds.slice();
   if (!picks.length || !state.previewFresh) return;
@@ -974,42 +988,20 @@ duplicateBtn.addEventListener("click", async () => {
     return;
   }
 
-  const epoch = state.epoch;
-  // 提交期间阻止其他改稿（列表置灰），成功或失败后恢复
-  state.duplicating = true;
-  syncBusy();
-  syncToolbar();
-  try {
-    const data = await api("/api/duplicate", {
-      ...snapshot(),
-      selected_ids: picks,
-      next_id: state.idCounter, // 已用身份上界：副本从 next_id+1 起取新身份
-    });
-    if (epoch !== state.epoch) return; // 已重新导入：旧复制结果不得写回新草稿
-    // 仅在服务端成功后才改动草稿，保证列表 / 预览 / 对照 / 下载立即对应同一份草稿
-    state.orderIds = data.order_ids;
-    state.clauses = data.clauses.map((c) => ({
-      id: c.id,
-      original: parseInt(c.id.slice(1), 10),
-      body: c.body,
-    }));
-    state.idCounter = data.next_id; // 复制与拆分共用更新后的身份上界
-    state.pickIds = [];
-    state.duplicating = false;
-    touch();
-    render();
-  } catch (e) {
-    if (epoch !== state.epoch) return; // 旧草稿的失败不在新草稿上提示
-    // 复制失败：草稿未改动，恢复被暂时阻止的操作（勾选保持不变，可修正后重试）
-    state.duplicating = false;
-    alert("复制失败，草稿未改动：\n" + errorList(e).join("\n"));
-  } finally {
-    // 重新导入后，旧请求的收尾不得改动新稿的列表状态、提示或按钮
-    if (epoch === state.epoch) {
-      syncBusy();
-      syncToolbar();
-    }
-  }
+  // 参数准备：已用身份上界一并提交，副本从 next_id+1 起取新身份；
+  // 请求归属、草稿写回（采用接口返回的上界）与收尾由提交协调层统一处理
+  await submitWrite({
+    kind: "duplicate",
+    path: "/api/duplicate",
+    params: { selected_ids: picks, next_id: state.idCounter },
+    onSuccess: () => {
+      state.pickIds = [];
+    },
+    onError: (errors) => {
+      // 复制失败：草稿未改动，勾选保持不变，可修正后重试
+      alert("复制失败，草稿未改动：\n" + errors.join("\n"));
+    },
+  });
 });
 
 // --------------------------------------------------------------------------- //
@@ -1032,7 +1024,7 @@ clauseList.addEventListener("click", async (ev) => {
 
   const gap = ev.target.closest("[data-gap]");
   if (gap) {
-    if (state.splitting || listLocked()) return; // 拆分提交 / 列表锁定期间列表已置灰，这里再兜底
+    if (listLocked()) return; // 写稿提交 / 列表锁定期间列表已置灰，这里再兜底
     const card = gap.closest(".card");
     if (!card || card.dataset.id !== state.splittingId) return;
     state.splitOffset = parseInt(gap.dataset.gap, 10);
